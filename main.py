@@ -1,19 +1,23 @@
 import sys
+import os
+import uuid
+import time
+import mimetypes
+import platform
 from pathlib import Path
+from threading import Thread
+
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QPushButton, QFileDialog, QVBoxLayout, QHBoxLayout,
     QWidget, QMessageBox, QListWidget, QSizePolicy, QListWidgetItem, QDialog, QTextEdit, QScrollArea, QLineEdit
 )
 from PySide6.QtGui import QFont, QPixmap, QImage
-from PySide6.QtCore import Qt, QSysInfo
+from PySide6.QtCore import Qt
+
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.backends import default_backend
-import os
-import uuid
-from threading import Thread
-import time
-import mimetypes
+
 try:
     from PySide6.QtMultimediaWidgets import QCameraViewfinder
     from PySide6.QtMultimedia import QCamera, QImageCapture, QMediaDevices
@@ -22,17 +26,14 @@ except ImportError:
 
 IMPORT_DIR = Path("imported_docs")
 IMPORT_DIR.mkdir(exist_ok=True)
-
 TEMP_DIR = IMPORT_DIR / "tmp"
 TEMP_DIR.mkdir(exist_ok=True)
 
-# Überwachte Ordner werden in einer Datei gespeichert
 WATCHED_PATHS_FILE = Path("watched_folders.txt")
 def load_watched_folders():
     if WATCHED_PATHS_FILE.exists():
         return [Path(line.strip()) for line in WATCHED_PATHS_FILE.read_text(encoding="utf-8").splitlines() if line.strip()]
     else:
-        # Standardmäßig nur "watch_folder"
         default = Path("watch_folder")
         default.mkdir(exist_ok=True)
         return [default]
@@ -53,7 +54,6 @@ def encrypt_file(src_path, dest_path, key):
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=backend)
     encryptor = cipher.encryptor()
     padder = padding.PKCS7(128).padder()
-
     with open(src_path, "rb") as f_in, open(dest_path, "wb") as f_out:
         f_out.write(iv)
         while True:
@@ -131,38 +131,37 @@ class MainWindow(QMainWindow):
         nav_layout = QVBoxLayout()
         nav_layout.setSpacing(20)
 
+        btn_scan = QPushButton("Scannen")
+        btn_scan.setFont(QFont("Arial", 14))
+        btn_scan.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        btn_scan.clicked.connect(self.scan_document)
+        nav_layout.addWidget(btn_scan)
+
         btn_import = QPushButton("Importieren")
         btn_import.setFont(QFont("Arial", 14))
         btn_import.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btn_import.clicked.connect(self.import_document)
+        nav_layout.addWidget(btn_import)
 
         btn_export = QPushButton("Exportieren")
         btn_export.setFont(QFont("Arial", 14))
         btn_export.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btn_export.clicked.connect(self.export_document)
+        nav_layout.addWidget(btn_export)
 
         btn_preview = QPushButton("Vorschau")
         btn_preview.setFont(QFont("Arial", 14))
         btn_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btn_preview.setEnabled(False)
+        nav_layout.addWidget(btn_preview)
 
         btn_settings = QPushButton("Einstellungen")
         btn_settings.setFont(QFont("Arial", 14))
         btn_settings.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btn_settings.setEnabled(False)
-
-        btn_scan = QPushButton("Scannen")
-        btn_scan.setFont(QFont("Arial", 14))
-        btn_scan.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        btn_scan.clicked.connect(self.scan_document)
-        nav_layout.insertWidget(1, btn_scan)  # Button unter "Importieren" einfügen
-
-        nav_layout.addWidget(btn_import)
-        nav_layout.addWidget(btn_export)
-        nav_layout.addWidget(btn_preview)
         nav_layout.addWidget(btn_settings)
-        nav_layout.addStretch()
 
+        nav_layout.addStretch()
         nav_widget = QWidget()
         nav_widget.setLayout(nav_layout)
         nav_widget.setFixedWidth(200)
@@ -176,6 +175,9 @@ class MainWindow(QMainWindow):
         self.doc_list = QListWidget()
         self.refresh_doc_list()
         main_layout.addWidget(self.doc_list)
+
+        self.doc_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.doc_list.customContextMenuRequested.connect(self.show_doc_context_menu)
 
         # Suchfeld oben hinzufügen
         self.search_box = QLineEdit()
@@ -225,7 +227,27 @@ class MainWindow(QMainWindow):
 
     def refresh_doc_list(self):
         self.doc_list.clear()
-        for file in sorted(IMPORT_DIR.glob("*.enc")):
+        # Finde alle Basisdateien (ohne .vX)
+        files = list(IMPORT_DIR.glob("*.enc"))
+        base_files = {}
+        for file in files:
+            stem = file.stem
+            if ".v" in stem:
+                base, v = stem.rsplit(".v", 1)
+                try:
+                    v = int(v)
+                except ValueError:
+                    continue
+                key = base
+                if key not in base_files or base_files[key][1] < v:
+                    base_files[key] = (file, v)
+            else:
+                key = stem
+                # Wenn es noch keine Version gibt, ist das die aktuelle
+                if key not in base_files:
+                    base_files[key] = (file, 0)
+        # Zeige nur die aktuellste Version pro Dokument
+        for file, v in sorted(base_files.values(), key=lambda x: x[0].name):
             self.doc_list.addItem(file.name)
 
     def refresh_folder_list(self):
@@ -272,15 +294,23 @@ class MainWindow(QMainWindow):
             selected_files = file_dialog.selectedFiles()
             if selected_files:
                 src_path = Path(selected_files[0])
-                dest_path = IMPORT_DIR / (src_path.name + ".enc")
+                base_name = src_path.name
+                dest_path = IMPORT_DIR / (base_name + ".enc")
+                # Prüfe, ob schon eine Version existiert
+                if dest_path.exists():
+                    # Ermittle höchste Version
+                    stem, ext = os.path.splitext(base_name)
+                    versions = []
+                    for file in IMPORT_DIR.glob(f"{stem}.v*.{ext}.enc"):
+                        pass  # ... wie gehabt ...
+                    if versions:
+                        max_v = max([int(p.name.split(".v")[-1].split(f".{ext}.enc")[0]) for p in versions])
+                    else:
+                        max_v = 1
+                    # Alte Version umbenennen
+                    dest_path.rename(IMPORT_DIR / f"{stem}.v{max_v+1}.{ext}.enc")
                 encrypt_file(src_path, dest_path, KEY)
                 QMessageBox.information(self, "Importiert", f"Datei wurde importiert und verschlüsselt gespeichert:\n{dest_path}")
-
-                # Beispiel: Schreibe eine verschlüsselte temporäre Datei (Demo)
-                with open(src_path, "rb") as f:
-                    data = f.read()
-                temp_file = create_encrypted_temp_file(data, KEY)
-                delete_temp_file(temp_file)
                 self.refresh_doc_list()
 
     def export_document(self):
@@ -315,7 +345,14 @@ class MainWindow(QMainWindow):
             if self.preview_dialog:
                 self.preview_dialog.close()
             return
-        enc_path = IMPORT_DIR / item.text()
+        name = item.text()
+        if "(v" in name:
+            # Extrahiere echten Dateinamen
+            base, rest = name.split(" (v")
+            v = rest.split(")")[0]
+            enc_path = IMPORT_DIR / f"{base}.v{v}.enc"
+        else:
+            enc_path = IMPORT_DIR / name
         # Endung bestimmen (z.B. .pdf, .docx, .csv)
         orig_name = enc_path.name
         if orig_name.endswith('.enc'):
@@ -354,10 +391,15 @@ class MainWindow(QMainWindow):
                     except Exception:
                         dialect = csv.excel  # Fallback
                     reader = csv.reader(f, dialect)
-                    for row in reader:
-                        if any(text in (cell or "").lower() for cell in row):
-                            self.doc_list.addItem(file.name)
-                            break
+                    table = QTableWidget()
+                    rows = list(reader)
+                    if rows:
+                        table.setRowCount(len(rows))
+                        table.setColumnCount(len(rows[0]))
+                        for i, row in enumerate(rows):
+                            for j, cell in enumerate(row):
+                                table.setItem(i, j, QTableWidgetItem(cell))
+                    layout.addWidget(table)
             elif ext in [".jpg", ".jpeg", ".png", ".bmp", ".gif"]:
                 pixmap = QPixmap(str(tmp_path))
                 label = QLabel()
@@ -371,82 +413,31 @@ class MainWindow(QMainWindow):
             elif ext == ".pdf":
                 try:
                     import fitz  # PyMuPDF
-                    print(f"DEBUG: Öffne PDF: {tmp_path} (Größe: {tmp_path.stat().st_size} Bytes)")
                     doc = fitz.open(str(tmp_path))
-                    print(f"DEBUG: PDF Seiten: {doc.page_count}")
                     if doc.page_count > 0:
                         scroll = QScrollArea()
                         content = QWidget()
                         vbox = QVBoxLayout(content)
                         for page_num in range(doc.page_count):
                             page = doc.load_page(page_num)
-                            print(f"DEBUG: Seite {page_num+1} geladen")
                             pix = page.get_pixmap()
-                            print(f"DEBUG: PixMap: {pix.width}x{pix.height}, alpha={pix.alpha}")
                             label = QLabel()
                             if pix.alpha:
                                 img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGBA8888)
                             else:
                                 img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
                             if not img.isNull():
-                                print("DEBUG: Bild erfolgreich erstellt")
                                 label.setPixmap(QPixmap.fromImage(img).scaled(700, 900, Qt.KeepAspectRatio, Qt.SmoothTransformation))
                             else:
-                                print("DEBUG: Bild ist null!")
                                 label.setText(f"PDF-Seite {page_num+1} konnte nicht gerendert werden.")
                             vbox.addWidget(label)
                         scroll.setWidget(content)
                         layout.addWidget(scroll)
                     else:
-                        print("DEBUG: Leeres PDF")
                         layout.addWidget(QLabel("Leeres PDF."))
                     doc.close()
                 except Exception as e:
-                    print(f"DEBUG: Fehler bei PDF-Vorschau: {e}")
                     layout.addWidget(QLabel(f"PDF-Vorschau nicht möglich: {e}"))
-            elif ext in [".docx"]:
-                try:
-                    from docx2txt import process as docx2txt_process
-                    text = docx2txt_process(str(tmp_path))
-                    textedit = QTextEdit()
-                    textedit.setReadOnly(True)
-                    textedit.setText(text)
-                    layout.addWidget(textedit)
-                except Exception as e:
-                    layout.addWidget(QLabel(f"Word-Vorschau nicht möglich: {e}"))
-            elif ext in [".xlsx"]:
-                try:
-                    import openpyxl
-                    wb = openpyxl.load_workbook(str(tmp_path), read_only=True)
-                    text = ""
-                    for ws in wb.worksheets:
-                        text += f"Tabelle: {ws.title}\n"
-                        for row in ws.iter_rows(values_only=True):
-                            text += "\t".join([str(cell) if cell is not None else "" for cell in row]) + "\n"
-                        text += "\n"
-                    textedit = QTextEdit()
-                    textedit.setReadOnly(True)
-                    textedit.setText(text)
-                    layout.addWidget(textedit)
-                except Exception as e:
-                    layout.addWidget(QLabel(f"Excel-Vorschau nicht möglich: {e}"))
-            elif ext in [".pptx"]:
-                try:
-                    from pptx import Presentation
-                    text = ""
-                    prs = Presentation(str(tmp_path))
-                    for i, slide in enumerate(prs.slides):
-                        text += f"Folie {i+1}:\n"
-                        for shape in slide.shapes:
-                            if hasattr(shape, "text"):
-                                text += shape.text + "\n"
-                        text += "\n"
-                    textedit = QTextEdit()
-                    textedit.setReadOnly(True)
-                    textedit.setText(text)
-                    layout.addWidget(textedit)
-                except Exception as e:
-                    layout.addWidget(QLabel(f"PowerPoint-Vorschau nicht möglich: {e}"))
             else:
                 layout.addWidget(QLabel("Keine Vorschau für diesen Dateityp verfügbar."))
             dlg.show()
@@ -456,6 +447,51 @@ class MainWindow(QMainWindow):
                 tmp_path.unlink(missing_ok=True)
             except Exception:
                 pass
+
+    def show_doc_context_menu(self, pos):
+        item = self.doc_list.itemAt(pos)
+        if item is None:
+            return
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self.doc_list)
+        show_versions_action = menu.addAction("Andere Versionen anzeigen")
+        action = menu.exec(self.doc_list.mapToGlobal(pos))
+        if action == show_versions_action:
+            self.show_versions_dialog(item.text())
+
+    def show_versions_dialog(self, filename):
+        # Ermittle Basisname
+        base = filename
+        if base.endswith(".enc"):
+            base = base[:-4]
+        # Finde alle Versionen
+        versions = []
+        for file in IMPORT_DIR.glob(f"{base}.v*.enc"):
+            stem = file.stem
+            if ".v" in stem:
+                try:
+                    v = int(stem.rsplit(".v", 1)[1])
+                except ValueError:
+                    continue
+                versions.append((v, file))
+        if not versions:
+            QMessageBox.information(self, "Versionen", "Keine älteren Versionen gefunden.")
+            return
+        versions.sort(reverse=True)
+        # Dialog anzeigen
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Versionen von {base}")
+        layout = QVBoxLayout(dlg)
+        for v, file in versions:
+            btn = QPushButton(f"Version {v} anzeigen/exportieren")
+            btn.clicked.connect(lambda _, f=file: self.preview_or_export_version(f))
+            layout.addWidget(btn)
+        dlg.exec()
+
+    def preview_or_export_version(self, file):
+        # Zeige Vorschau oder Exportdialog für die gewählte Version
+        # (Kann analog zu preview_document/export_document implementiert werden)
+        pass
 
     def watch_folders(self):
         already_seen = {}
@@ -494,37 +530,29 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def scan_document(self):
-        os_type = QSysInfo.productType().lower()
-        if os_type in ["android", "ios"]:
-            # Kamera-Dialog für Mobile
-            dlg = QDialog(self)
-            dlg.setWindowTitle("Kamera-Scan")
-            dlg.setMinimumSize(400, 500)
-            layout = QVBoxLayout(dlg)
-
-            viewfinder = QCameraViewfinder()
-            layout.addWidget(viewfinder)
-
-            camera = QCamera(QMediaDevices.defaultVideoInput())
-            image_capture = QImageCapture(camera)
-            camera.setViewfinder(viewfinder)
-            camera.start()
-
-            btn_capture = QPushButton("Foto aufnehmen")
-            layout.addWidget(btn_capture)
-
-            def capture_photo():
-                image_capture.captureToFile()
-                QMessageBox.information(dlg, "Foto", "Foto aufgenommen und gespeichert.")
-                camera.stop()
-                dlg.accept()
-                # TODO: Importiere das Bild wie ein gescanntes Dokument
-
-            btn_capture.clicked.connect(capture_photo)
-            dlg.exec()
+        os_type = platform.system().lower()
+        if os_type == "windows":
+            try:
+                import win32com.client
+                wia = win32com.client.Dispatch("WIA.CommonDialog")
+                device = wia.ShowSelectDevice()
+                if device is None:
+                    QMessageBox.information(self, "Scanner", "Kein Scanner ausgewählt.")
+                    return
+                item = device.Items[1]
+                image = wia.ShowAcquireImage(device)
+                if image:
+                    # Speichere das Bild temporär
+                    temp_path = Path("scanned_image.jpg")
+                    image.SaveFile(str(temp_path))
+                    QMessageBox.information(self, "Scanner", f"Scan gespeichert: {temp_path}")
+                    # TODO: Importiere das Bild wie ein gescanntes Dokument
+                else:
+                    QMessageBox.warning(self, "Scanner", "Scan fehlgeschlagen.")
+            except Exception as e:
+                QMessageBox.critical(self, "Scanner", f"Fehler beim Scannen: {e}")
         else:
-            QMessageBox.information(self, "Scanner", "Hier wird ein lokaler Scanner verwendet (Platzhalter).")
-            # TODO: Scanner-Integration für Desktop (TWAIN/SANE/WIA)
+            QMessageBox.information(self, "Scanner", "Scanner-Integration ist nur unter Windows (WIA) vorbereitet.\nFür Linux/Mac bitte SANE/TWAIN-Anbindung ergänzen.")
 
     def search_documents(self, text):
         import pytesseract
@@ -610,6 +638,11 @@ class MainWindow(QMainWindow):
                         pass
             except Exception as e:
                 print(f"DEBUG: Fehler bei Datei {file.name}: {e}")
+            finally:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
