@@ -1,0 +1,75 @@
+{
+  "root": [
+    {
+      "type": "file",
+      "name": "Monde.csv.enc"
+    },
+    {
+      "type": "file",
+      "name": "Raumstationen.csv.enc"
+    },
+    {
+      "type": "file",
+      "name": "Au\u00dfenposten.csv.enc"
+    },
+    {
+      "type": "file",
+      "name": "AITS_Antrag_Auswertung_Nutzungs_Verkehrsdaten_VED_v_1_0.pdf.enc"
+    },
+    {
+      "type": "file",
+      "name": "requirements.txt.enc"
+    },
+    {
+      "type": "file",
+      "name": "Planeten.csv.enc"
+    },
+    {
+      "type": "file",
+      "name": "Mining.csv.enc"
+    },
+    {
+      "type": "file",
+      "name": "Raumschiffe.csv.enc"
+    },
+    {
+      "type": "file",
+      "name": "Systeme.csv.enc"
+    },
+    {
+      "type": "file",
+      "name": "2022 Mitarbeiterjahresgespr\u00e4ch - Christian H\u00e4u\u00dfler.v2..pdf.enc"
+    },
+    {
+      "type": "file",
+      "name": "Sprungtore.csv.enc"
+    },
+    {
+      "type": "file",
+      "name": "2022 Mitarbeiterjahresgespr\u00e4ch - Christian H\u00e4u\u00dfler.pdf.enc"
+    },
+    {
+      "type": "file",
+      "name": "Asteroideng\u00fcrtel.csv.enc"
+    },
+    {
+      "type": "file",
+      "name": "2022 Mitarbeiterjahresgespr\u00e4ch - Christian H\u00e4u\u00dfler.v2.pdf.enc"
+    },
+    {
+      "type": "folder",
+      "name": "Test",
+      "children": [
+        {
+          "type": "file",
+          "name": "2022 Mitarbeiterjahresgespr\u00e4ch - Christian H\u00e4u\u00dfler.enc"
+        }
+      ]
+    },
+    {
+      "type": "folder",
+      "name": "sfsdf",
+      "children": []
+    }
+  ]
+}

@@ -1,6 +1,9 @@
-PySide6>=6.6
-PySide6-Addons>=6.5
-cryptography>=42.0
-pytesseract>=0.3
-Pillow>=10.0
-PyMuPDF>=1.23
+PySide6
+cryptography
+PyMuPDF
+Pillow
+pytesseract
+mammoth
+pandas
+openpyxl
+python-pptx

@@ -6,13 +6,18 @@ import mimetypes
 import platform
 from pathlib import Path
 from threading import Thread
+from subprocess import run
 
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QLabel, QPushButton, QFileDialog, QVBoxLayout, QHBoxLayout,
-    QWidget, QMessageBox, QListWidget, QSizePolicy, QListWidgetItem, QDialog, QTextEdit, QScrollArea, QLineEdit
+    QApplication, QMainWindow, QLabel, QPushButton, QFileDialog,
+    QVBoxLayout, QHBoxLayout, QWidget, QMessageBox,
+    QListWidget, QSizePolicy, QListWidgetItem, QDialog,
+    QTextEdit, QScrollArea, QLineEdit, QFileIconProvider,
+    QListView, QInputDialog, QTableWidget, QTableWidgetItem,
+    QMenu
 )
-from PySide6.QtGui import QFont, QPixmap, QImage
-from PySide6.QtCore import Qt
+from PySide6.QtGui     import QFont, QPixmap, QImage, QFontMetrics, QAction
+from PySide6.QtCore import Qt, QSize, QFileInfo
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
@@ -24,11 +29,19 @@ try:
 except ImportError:
     QCameraViewfinder = None
 
+import mammoth
+import pandas as pd
+from pptx import Presentation
+
 IMPORT_DIR = Path("imported_docs")
 IMPORT_DIR.mkdir(exist_ok=True)
 TEMP_DIR = IMPORT_DIR / "tmp"
 TEMP_DIR.mkdir(exist_ok=True)
 
+# unterstützte Office-Formate für headless → PDF
+office = {".doc", ".docx", ".odt", ".rtf",
+          ".xls", ".xlsx", ".ods",
+          ".ppt", ".pptx", ".odp"}
 WATCHED_PATHS_FILE = Path("watched_folders.txt")
 def load_watched_folders():
     if WATCHED_PATHS_FILE.exists():
@@ -122,134 +135,396 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DMS – Dokumentenmanagementsystem")
-        self.setMinimumSize(1000, 700)
+        self.resize(1000, 700)
 
-        # Überwachte Ordner laden
         self.watched_folders = load_watched_folders()
+        self.preview_dialog = None
 
-        # Linke Seitenleiste (Navigation)
-        nav_layout = QVBoxLayout()
-        nav_layout.setSpacing(20)
+        # alle UI-Elemente und Layouts anlegen
+        self.setup_ui()
 
-        btn_scan = QPushButton("Scannen")
-        btn_scan.setFont(QFont("Arial", 14))
-        btn_scan.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        btn_scan.clicked.connect(self.scan_document)
-        nav_layout.addWidget(btn_scan)
+        # Ordner-Watcher starten
+        self.watching = True
+        Thread(target=self.watch_folders, daemon=True).start()
 
-        btn_import = QPushButton("Importieren")
-        btn_import.setFont(QFont("Arial", 14))
-        btn_import.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        btn_import.clicked.connect(self.import_document)
-        nav_layout.addWidget(btn_import)
-
-        btn_export = QPushButton("Exportieren")
-        btn_export.setFont(QFont("Arial", 14))
-        btn_export.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        btn_export.clicked.connect(self.export_document)
-        nav_layout.addWidget(btn_export)
-
-        btn_preview = QPushButton("Vorschau")
-        btn_preview.setFont(QFont("Arial", 14))
-        btn_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        btn_preview.setEnabled(False)
-        nav_layout.addWidget(btn_preview)
-
-        btn_settings = QPushButton("Einstellungen")
-        btn_settings.setFont(QFont("Arial", 14))
-        btn_settings.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        btn_settings.setEnabled(False)
-        nav_layout.addWidget(btn_settings)
-
-        nav_layout.addStretch()
+    def setup_ui(self):
+        # ─── NAVIGATION BUTTONS ─────────────────────────────────────────────
+        nav = QVBoxLayout()
+        for label, slot in [
+            ("Scannen", self.scan_document),
+            ("Importieren", self.import_document),
+            ("Exportieren", self.export_document),
+            ("Vorschau", self.preview_document),
+            ("Einstellungen", lambda: None)
+        ]:
+            btn = QPushButton(label)
+            btn.setFont(QFont("Arial", 14))
+            btn.clicked.connect(slot)
+            nav.addWidget(btn)
+            if label == "Vorschau":
+                self.btn_preview = btn
+                btn.setEnabled(False)
+        nav.addStretch()
         nav_widget = QWidget()
-        nav_widget.setLayout(nav_layout)
-        nav_widget.setFixedWidth(200)
+        nav_widget.setLayout(nav)
+        nav_widget.setFixedWidth(180)
 
-        # Hauptbereich mit Dokumentenliste und Überwachte Ordner
-        main_layout = QVBoxLayout()
-        label = QLabel("Importierte Dokumente:")
-        label.setFont(QFont("Arial", 16))
-        main_layout.addWidget(label)
+        # ─── ORDNER-NAVIGATION (echte Unterordner + „Alle Dokumente“) ─────────
+        # nutze QFileIconProvider, um ein konsistentes Ordner-Icon zu holen
+        provider = QFileIconProvider()
+        dir_icon = provider.icon(QFileIconProvider.Folder)
 
+        # virtuellen Ordner-Hinzufügen-Button
+        folder_box = QVBoxLayout()
+        btn_new_folder = QPushButton("+ Ordner")
+        btn_new_folder.setFixedWidth(80)
+        btn_new_folder.clicked.connect(self.add_virtual_folder)
+        folder_box.addWidget(btn_new_folder, 0, Qt.AlignHCenter)
+
+        self.folder_nav = QListWidget()
+        self.folder_nav.setIconSize(QSize(16,16))
+        # Wurzel-Eintrag
+        self.folder_nav.addItem(QListWidgetItem(dir_icon, "Alle Dokumente"))
+        # alle Unterordner in IMPORT_DIR
+        for d in sorted(IMPORT_DIR.iterdir()):
+            if d.is_dir():
+                self.folder_nav.addItem(QListWidgetItem(dir_icon, d.name))
+        self.folder_nav.currentItemChanged.connect(self.on_folder_selected)
+        self.folder_nav.setFixedWidth(180)
+        folder_box.addWidget(self.folder_nav)
+        folder_widget = QWidget()
+        folder_widget.setLayout(folder_box)
+        folder_widget.setFixedWidth(200)
+
+        # ─── DATEILISTE ────────────────────────────────────────────────────
         self.doc_list = QListWidget()
-        self.refresh_doc_list()
-        main_layout.addWidget(self.doc_list)
-
+        # Drag & Drop und Kontextmenü aktivieren
+        self.doc_list.setDragEnabled(True)
+        self.doc_list.setAcceptDrops(True)
+        self.doc_list.setDefaultDropAction(Qt.MoveAction)
         self.doc_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.doc_list.customContextMenuRequested.connect(self.show_doc_context_menu)
+        self.doc_list.setViewMode(QListWidget.IconMode)
+        self.doc_list.setIconSize(QSize(64,64))
+        self.doc_list.setResizeMode(QListWidget.Adjust)
+        # echtes Grid-Layout mit Zeilenumbruch und Text-Umbruch
+        self.doc_list.setWordWrap(True)
+        self.doc_list.setFlow(QListView.LeftToRight)
+        self.doc_list.setWrapping(True)
+        self.doc_list.setUniformItemSizes(True)
+        self.doc_list.currentItemChanged.connect(self.on_file_selected)
+ 
+        # ─── DATEI-INFOS + KLEINE PREVIEW ─────────────────────────────────
+        info = QVBoxLayout()
+        self.info_name = QLabel("Name: –")
+        self.info_size = QLabel("Größe: –")
+        info.addWidget(self.info_name)
+        info.addWidget(self.info_size)
+        self.preview_small = QLabel()
+        self.preview_small.setFixedSize(120,120)
+        self.preview_small.setStyleSheet("border:1px solid #aaa;")
+        self.preview_small.mousePressEvent = lambda e: self.show_large_preview()
+        info.addWidget(self.preview_small)
+        info.addStretch()
+        info_widget = QWidget()
+        info_widget.setLayout(info)
+        info_widget.setFixedWidth(200)
 
-        # Suchfeld oben hinzufügen
-        self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Suche in Dokumenten...")
-        self.search_box.textChanged.connect(self.search_documents)
-        main_layout.insertWidget(1, self.search_box)  # Suchfeld ganz oben
-
-        # Überwachte Ordner anzeigen
-        folder_label = QLabel("Überwachte Ordner:")
-        folder_label.setFont(QFont("Arial", 12))
-        main_layout.addWidget(folder_label)
-
+        # ─── WATCH-FOLDER VERWALTUNG ───────────────────────────────────────
+        bottom = QHBoxLayout()
         self.folder_list = QListWidget()
         self.refresh_folder_list()
-        main_layout.addWidget(self.folder_list)
+        bottom.addWidget(self.folder_list)
+        btn_add = QPushButton("+"); btn_add.clicked.connect(self.add_watch_folder)
+        btn_rem = QPushButton("–"); btn_rem.clicked.connect(self.remove_selected_watch_folder)
+        bottom.addWidget(btn_add); bottom.addWidget(btn_rem)
+        bottom_widget = QWidget()
+        bottom_widget.setLayout(bottom)
 
-        btn_add_folder = QPushButton("Ordner hinzufügen")
-        btn_add_folder.clicked.connect(self.add_watch_folder)
-        main_layout.addWidget(btn_add_folder)
+        # ─── LAYOUT ZUSAMMENSETZEN ────────────────────────────────────────
+        top = QHBoxLayout()
+        top.addWidget(nav_widget)
+        top.addWidget(folder_widget)
+        top.addWidget(self.doc_list, 1)    # <— hier das Icon‐Grid einfügen
+        top.addWidget(info_widget)         # <— hier die Info‐Spalte einfügen
 
-        main_layout.addStretch()
-        main_widget = QWidget()
-        main_widget.setLayout(main_layout)
-
-        # Gesamtlayout
-        layout = QHBoxLayout()
-        layout.addWidget(nav_widget)
-        layout.addWidget(main_widget)
+        main = QVBoxLayout()
+        main.addLayout(top, 1)
+        main.addWidget(bottom_widget)
 
         container = QWidget()
-        container.setLayout(layout)
+        container.setLayout(main)
         self.setCentralWidget(container)
 
-        # Ordnerüberwachung starten
-        self.watching = True
-        self.watcher_thread = Thread(target=self.watch_folders, daemon=True)
-        self.watcher_thread.start()
+        # initiale Befüllung der Dateiliste (erst jetzt existiert info_name)
+        self.refresh_doc_list()
 
-        # Vorschau-Button aktivieren
-        self.btn_preview = btn_preview
-        self.doc_list.currentItemChanged.connect(lambda: self.enable_preview_button())
-        btn_preview.setEnabled(False)
-        btn_preview.clicked.connect(self.preview_document)
+    # ─── SLOT-METHODEN (korrekt eingerückt!) ─────────────────────────────
+    def on_folder_selected(self, current, previous):
+        if not current:
+            return
+        text = current.text()
+        if text == "Alle Dokumente":
+            self.refresh_doc_list()
+        else:
+            path = IMPORT_DIR / text
+            if path.is_dir():
+                self.refresh_doc_list(path)
 
-        self.preview_dialog = None
-        self.doc_list.currentItemChanged.connect(self.preview_document)  # Vorschau sofort beim Auswählen
+    def preview_document(self):
+        item = self.doc_list.currentItem()
+        if not item:
+            if self.preview_dialog:
+                self.preview_dialog.close()
+            return
 
-    def refresh_doc_list(self):
-        self.doc_list.clear()
-        # Finde alle Basisdateien (ohne .vX)
-        files = list(IMPORT_DIR.glob("*.enc"))
-        base_files = {}
-        for file in files:
-            stem = file.stem
-            if ".v" in stem:
-                base, v = stem.rsplit(".v", 1)
-                try:
-                    v = int(v)
-                except ValueError:
-                    continue
-                key = base
-                if key not in base_files or base_files[key][1] < v:
-                    base_files[key] = (file, v)
+        # Entschlüssele in eine temporäre Datei
+        enc_path: Path = item.data(Qt.UserRole)
+        # Icon-Provider schon jetzt bereitstellen (für CSV/Default-Fälle)
+        provider = QFileIconProvider()
+        from tempfile import NamedTemporaryFile
+        suffix = Path(enc_path.stem).suffix or ""
+        with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            decrypt_file(enc_path, tmp_path, KEY)
+
+            # großen Vorschau-Dialog aufbauen
+            dlg = QDialog(self)
+            # Referenz zum Schließen später behalten
+            self.preview_dialog = dlg
+            dlg.setWindowTitle(enc_path.stem)
+            dlg.resize(800, 600)
+            layout = QVBoxLayout(dlg)
+
+            ext = tmp_path.suffix.lower()
+            # TXT-, MD-, PY-Dateien → reiner Text
+            if ext in (".txt", ".md", ".py"):
+                txt = tmp_path.read_text(encoding="utf-8", errors="ignore")
+                te = QTextEdit(); te.setReadOnly(True); te.setPlainText(txt)
+                layout.addWidget(te); dlg.exec(); return
+            # DOCX → HTML per Mammoth
+            if ext == ".docx":
+                # Temp-File sauber öffnen und schließen
+                with tmp_path.open("rb") as f:
+                    html = mammoth.convert_to_html(f).value
+                te = QTextEdit(); te.setReadOnly(True); te.setHtml(html)
+                layout.addWidget(te); dlg.exec(); return
+            # XLSX/ODS → HTML via Pandas
+            elif ext in (".xls", ".xlsx", ".ods"):
+                df = pd.read_excel(tmp_path, engine="openpyxl")
+                html = df.to_html(index=False)
+                te = QTextEdit(); te.setReadOnly(True); te.setHtml(html)
+                layout.addWidget(te); dlg.exec(); return
+            # PPTX/ODP → Einfacher HTML-Text via python-pptx
+            elif ext in (".ppt", ".pptx", ".odp"):
+                prs = Presentation(str(tmp_path))
+                html = ""
+                for slide in prs.slides:
+                    for shape in slide.shapes:
+                        if shape.has_text_frame:
+                            html += "<p>" + shape.text.replace("\n","<br>") + "</p>"
+                te = QTextEdit(); te.setReadOnly(True); te.setHtml(html or "<p>Keine Textinhalte.</p>")
+                layout.addWidget(te); dlg.exec(); return
+            # CSV → Tabelle
+            if ext == ".csv":
+                import csv
+                table = QTableWidget()
+                # CSV einlesen
+                with open(tmp_path, newline="", encoding="utf-8", errors="ignore") as f:
+                    reader = csv.reader(f)
+                    data = list(reader)
+                if data:
+                    table.setColumnCount(len(data[0]))
+                    table.setRowCount(len(data))
+                    for r, row in enumerate(data):
+                        for c, cell in enumerate(row):
+                            table.setItem(r, c, QTableWidgetItem(cell))
+                    table.resizeColumnsToContents()
+                layout.addWidget(table)
+                dlg.exec()
+                return
+
+            # Pixmap für Grafik, PDF, Office oder Icon ermitteln
+            if ext in (".png", ".jpg", ".jpeg", ".bmp", ".gif"):
+                pix = QPixmap(str(tmp_path))
+            elif ext in office:
+                # Office → Headless PDF → erste Seite
+                pdf_tmp = tmp_path.with_suffix(".pdf")
+                run(["soffice","--headless","--convert-to","pdf",
+                     "--outdir", str(pdf_tmp.parent), str(tmp_path)], check=False)
+                import fitz
+                doc = fitz.open(str(pdf_tmp))
+                pm = doc.load_page(0).get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                img = QImage(pm.samples, pm.width, pm.height, pm.stride, QImage.Format_RGB888)
+                pix = QPixmap.fromImage(img)
+                doc.close()
+            elif ext == ".pdf":
+                import fitz
+                doc = fitz.open(str(tmp_path))
+                pm = doc.load_page(0).get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                img = QImage(pm.samples, pm.width, pm.height, pm.stride, QImage.Format_RGB888)
+                pix = QPixmap.fromImage(img)
+                doc.close()
             else:
-                key = stem
-                # Wenn es noch keine Version gibt, ist das die aktuelle
-                if key not in base_files:
-                    base_files[key] = (file, 0)
-        # Zeige nur die aktuellste Version pro Dokument
-        for file, v in sorted(base_files.values(), key=lambda x: x[0].name):
-            self.doc_list.addItem(file.name)
+                # Fallback-Icon
+                icon = provider.icon(QFileInfo(tmp_path))
+                pix = icon.pixmap(800, 600)
 
+            # alle Grafik-/PDF-Fälle: zoombarer View
+            from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QSlider, QLabel, QHBoxLayout
+            # Zoom‐Control
+            ctrl = QHBoxLayout()
+            ctrl.addWidget(QLabel("Zoom %:"))
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(10, 400)
+            slider.setValue(100)
+            ctrl.addWidget(slider)
+            layout.addLayout(ctrl)
+
+            # Grafik-View
+            view = QGraphicsView()
+            scene = QGraphicsScene(view)
+            item = scene.addPixmap(pix)
+            view.setScene(scene)
+            view.setDragMode(QGraphicsView.ScrollHandDrag)
+            view.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+            layout.addWidget(view, 1)
+
+            # Zoom-Funktion verbinden
+            def on_zoom(val):
+                view.resetTransform()
+                factor = val / 100.0
+                view.scale(factor, factor)
+            slider.valueChanged.connect(on_zoom)
+
+            dlg.exec()
+        finally:
+            # versuche zu löschen, ignoriere falls noch in Benutzung
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+
+    def show_large_preview(self):
+        self.preview_document()
+
+    def remove_selected_watch_folder(self):
+        item = self.folder_list.currentItem()
+        if not item:
+            return
+        # hier dein Entfernen-Code …
+
+    # ─── BISHERIGE FUNKTIONEN UNVERÄNDERT EINBAUEN ───────────────────────
+    def refresh_doc_list(self, folder: Path = None):
+        """
+        Zeigt im Icon-Grid alle *.enc-Dateien in IMPORT_DIR (oder Unterordner),
+        aber elidiert die Anzeige ohne '.enc' – voller Name als Tooltip.
+        """
+        folder = folder or IMPORT_DIR
+        self.doc_list.clear()
+        provider = QFileIconProvider()
+        fm = QFontMetrics(self.doc_list.font())
+        max_width = 100  # px für den elidierten Text
+        for entry in sorted(folder.glob("*.enc")):
+            # Originalname und Extension
+            orig = entry.stem  # z.B. "Report.docx"
+            # passendes Icon nach Original-Extension
+            icon = provider.icon(QFileInfo(orig))
+            elided = fm.elidedText(orig, Qt.ElideRight, max_width)
+            item = QListWidgetItem(icon, elided)
+            # speichere das komplette Path-Objekt
+            item.setData(Qt.UserRole, entry)
+            item.setToolTip(orig)
+            self.doc_list.addItem(item)
+ 
+    def on_file_selected(self, current, previous):
+        """
+        Wenn ein Icon in der Mitte ausgewählt wird, entschlüsseln wir
+        und zeigen Name, Größe und kleine Vorschau in der rechten Spalte.
+        """
+        if not current:
+            return
+        enc_path: Path = current.data(Qt.UserRole)
+        # für kleine Vorschau in TEMP entschlüsseln und laden
+        from tempfile import NamedTemporaryFile
+        # suffix aus Original-Extension
+        suffix = Path(enc_path.stem).suffix or ""
+        with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            decrypt_file(enc_path, tmp_path, KEY)
+            # Dateiendung für Vorschau ermitteln
+            ext = tmp_path.suffix.lower()
+            provider = QFileIconProvider()
+            if ext in (".png", ".jpg", ".jpeg", ".bmp", ".gif"):
+                pix = QPixmap(str(tmp_path))
+            # PDF-Formate: erste Seite als Bild
+            elif ext == ".pdf":
+                import fitz
+                doc = fitz.open(str(tmp_path))
+                # schärfer rendern mit höherem Zoom
+                mat = fitz.Matrix(2, 2)
+                pm = doc.load_page(0).get_pixmap(matrix=mat, alpha=False)
+                img = QImage(pm.samples, pm.width, pm.height, pm.stride, QImage.Format_RGB888)
+                pix = QPixmap.fromImage(img)
+                doc.close()
+            # CSV bekommt ein generisches Icon
+            elif ext == ".csv":
+                icon = provider.icon(QFileInfo(tmp_path))
+                pix = icon.pixmap(120, 120)
+            # alle anderen: Standard-Icon
+            else:
+                icon = provider.icon(QFileInfo(tmp_path))
+                pix = icon.pixmap(120, 120)
+
+            # Name & Größe anzeigen
+            display = enc_path.stem
+            self.info_name.setText(f"Name: {display}")
+            size = tmp_path.stat().st_size
+            self.info_size.setText(f"Größe: {size} Bytes")
+            if not pix.isNull():
+                self.preview_small.setPixmap(pix.scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            else:
+                self.preview_small.clear()
+        finally:
+            try:
+                tmp_path.unlink()
+            except:
+                pass
+
+    def show_large_preview(self):
+        self.preview_document()
+
+    def remove_selected_watch_folder(self):
+        item = self.folder_list.currentItem()
+        if not item:
+            return
+        # hier dein Entfernen-Code …
+
+    # ─── BISHERIGE FUNKTIONEN UNVERÄNDERT EINBAUEN ───────────────────────
+    def refresh_doc_list(self, folder: Path = None):
+        """
+        Zeigt im Icon-Grid alle *.enc-Dateien in IMPORT_DIR (oder Unterordner),
+        aber elidiert die Anzeige ohne '.enc' – voller Name als Tooltip.
+        """
+        folder = folder or IMPORT_DIR
+        self.doc_list.clear()
+        provider = QFileIconProvider()
+        fm = QFontMetrics(self.doc_list.font())
+        max_width = 100  # px für den elidierten Text
+        for entry in sorted(folder.glob("*.enc")):
+            # Originalname und Extension
+            orig = entry.stem  # z.B. "Report.docx"
+            # passendes Icon nach Original-Extension
+            icon = provider.icon(QFileInfo(orig))
+            elided = fm.elidedText(orig, Qt.ElideRight, max_width)
+            item = QListWidgetItem(icon, elided)
+            # speichere das komplette Path-Objekt
+            item.setData(Qt.UserRole, entry)
+            item.setToolTip(orig)
+            self.doc_list.addItem(item)
+ 
     def refresh_folder_list(self):
         self.folder_list.clear()
         for folder in self.watched_folders:
@@ -339,159 +614,51 @@ class MainWindow(QMainWindow):
         item = self.doc_list.currentItem()
         self.btn_preview.setEnabled(item is not None)
 
-    def preview_document(self):
-        item = self.doc_list.currentItem()
-        if not item:
-            if self.preview_dialog:
-                self.preview_dialog.close()
-            return
-        name = item.text()
-        if "(v" in name:
-            # Extrahiere echten Dateinamen
-            base, rest = name.split(" (v")
-            v = rest.split(")")[0]
-            enc_path = IMPORT_DIR / f"{base}.v{v}.enc"
-        else:
-            enc_path = IMPORT_DIR / name
-        # Endung bestimmen (z.B. .pdf, .docx, .csv)
-        orig_name = enc_path.name
-        if orig_name.endswith('.enc'):
-            orig_name = orig_name[:-4]
-        orig_suffix = Path(orig_name).suffix or ".tmp"
-        from tempfile import NamedTemporaryFile
-        with NamedTemporaryFile(delete=False, suffix=orig_suffix) as tmp:
-            tmp_path = Path(tmp.name)
-        try:
-            decrypt_file(enc_path, tmp_path, KEY)
-            ext = tmp_path.suffix.lower()
-            mime, _ = mimetypes.guess_type(tmp_path.name)
-            # Schließe alte Vorschau
-            if self.preview_dialog:
-                self.preview_dialog.close()
-            dlg = QDialog(self)
-            dlg.setWindowTitle(f"Vorschau: {item.text()}")
-            dlg.setMinimumSize(800, 600)
-            layout = QVBoxLayout(dlg)
+    
 
-            if ext in [".txt", ".py", ".md"]:
-                with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
-                    text = f.read()
-                textedit = QTextEdit()
-                textedit.setReadOnly(True)
-                textedit.setText(text)
-                layout.addWidget(textedit)
-            elif ext == ".csv":
-                from PySide6.QtWidgets import QTableWidget, QTableWidgetItem
-                import csv
-                with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
-                    sample = f.read(2048)
-                    f.seek(0)
-                    try:
-                        dialect = csv.Sniffer().sniff(sample)
-                    except Exception:
-                        dialect = csv.excel  # Fallback
-                    reader = csv.reader(f, dialect)
-                    table = QTableWidget()
-                    rows = list(reader)
-                    if rows:
-                        table.setRowCount(len(rows))
-                        table.setColumnCount(len(rows[0]))
-                        for i, row in enumerate(rows):
-                            for j, cell in enumerate(row):
-                                table.setItem(i, j, QTableWidgetItem(cell))
-                    layout.addWidget(table)
-            elif ext in [".jpg", ".jpeg", ".png", ".bmp", ".gif"]:
-                pixmap = QPixmap(str(tmp_path))
-                label = QLabel()
-                if not pixmap.isNull():
-                    label.setPixmap(pixmap.scaled(700, 900, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                else:
-                    label.setText("Bild konnte nicht geladen werden.")
-                scroll = QScrollArea()
-                scroll.setWidget(label)
-                layout.addWidget(scroll)
-            elif ext == ".pdf":
-                try:
-                    import fitz  # PyMuPDF
-                    doc = fitz.open(str(tmp_path))
-                    if doc.page_count > 0:
-                        scroll = QScrollArea()
-                        content = QWidget()
-                        vbox = QVBoxLayout(content)
-                        for page_num in range(doc.page_count):
-                            page = doc.load_page(page_num)
-                            pix = page.get_pixmap()
-                            label = QLabel()
-                            if pix.alpha:
-                                img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGBA8888)
-                            else:
-                                img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
-                            if not img.isNull():
-                                label.setPixmap(QPixmap.fromImage(img).scaled(700, 900, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                            else:
-                                label.setText(f"PDF-Seite {page_num+1} konnte nicht gerendert werden.")
-                            vbox.addWidget(label)
-                        scroll.setWidget(content)
-                        layout.addWidget(scroll)
-                    else:
-                        layout.addWidget(QLabel("Leeres PDF."))
-                    doc.close()
-                except Exception as e:
-                    layout.addWidget(QLabel(f"PDF-Vorschau nicht möglich: {e}"))
-            else:
-                layout.addWidget(QLabel("Keine Vorschau für diesen Dateityp verfügbar."))
-            dlg.show()
-            self.preview_dialog = dlg
-        finally:
+    def delete_document(self, item):
+        path: Path = item.data(Qt.UserRole)
+        if QMessageBox.question(self, "Löschen", f"Datei wirklich löschen?\n{path.name}") == QMessageBox.Yes:
             try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+                path.unlink()
+                self.refresh_doc_list()
+                QMessageBox.information(self, "Gelöscht", f"{path.name} wurde gelöscht.")
+            except Exception as e:
+                QMessageBox.critical(self, "Fehler", f"Löschen fehlgeschlagen:\n{e}")
+
+    def move_document(self, item, target_folder: str):
+        src: Path = item.data(Qt.UserRole)
+        if target_folder == "Alle Dokumente":
+            dst_dir = IMPORT_DIR
+        else:
+            dst_dir = IMPORT_DIR / target_folder
+        dst_dir.mkdir(exist_ok=True)
+        dst = dst_dir / src.name
+        try:
+            src.replace(dst)
+            self.refresh_doc_list()
+            QMessageBox.information(self, "Verschoben", f"{src.name} → {target_folder}")
+        except Exception as e:
+            QMessageBox.critical(self, "Fehler", f"Verschieben fehlgeschlagen:\n{e}")
 
     def show_doc_context_menu(self, pos):
+        """Rechtsklick-Kontextmenü für die Dateiliste."""
         item = self.doc_list.itemAt(pos)
-        if item is None:
+        if not item:
             return
-        from PySide6.QtWidgets import QMenu
         menu = QMenu(self.doc_list)
-        show_versions_action = menu.addAction("Andere Versionen anzeigen")
+        delete_act = QAction("Löschen", self)
+        move_act   = QAction("Verschieben…", self)
+        menu.addAction(delete_act)
+        menu.addAction(move_act)
         action = menu.exec(self.doc_list.mapToGlobal(pos))
-        if action == show_versions_action:
-            self.show_versions_dialog(item.text())
-
-    def show_versions_dialog(self, filename):
-        # Ermittle Basisname
-        base = filename
-        if base.endswith(".enc"):
-            base = base[:-4]
-        # Finde alle Versionen
-        versions = []
-        for file in IMPORT_DIR.glob(f"{base}.v*.enc"):
-            stem = file.stem
-            if ".v" in stem:
-                try:
-                    v = int(stem.rsplit(".v", 1)[1])
-                except ValueError:
-                    continue
-                versions.append((v, file))
-        if not versions:
-            QMessageBox.information(self, "Versionen", "Keine älteren Versionen gefunden.")
-            return
-        versions.sort(reverse=True)
-        # Dialog anzeigen
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"Versionen von {base}")
-        layout = QVBoxLayout(dlg)
-        for v, file in versions:
-            btn = QPushButton(f"Version {v} anzeigen/exportieren")
-            btn.clicked.connect(lambda _, f=file: self.preview_or_export_version(f))
-            layout.addWidget(btn)
-        dlg.exec()
-
-    def preview_or_export_version(self, file):
-        # Zeige Vorschau oder Exportdialog für die gewählte Version
-        # (Kann analog zu preview_document/export_document implementiert werden)
-        pass
+        if action == delete_act:
+            self.delete_document(item)
+        elif action == move_act:
+            folders = ["Alle Dokumente"] + [d.name for d in IMPORT_DIR.iterdir() if d.is_dir()]
+            tgt, ok = QInputDialog.getItem(self, "Verschieben", "Zielordner:", folders, 0, False)
+            if ok:
+                self.move_document(item, tgt)
 
     def watch_folders(self):
         already_seen = {}
@@ -643,6 +810,22 @@ class MainWindow(QMainWindow):
                     temp_path.unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    def add_virtual_folder(self):
+        """Legt einen neuen Unterordner in imported_docs an und aktualisiert die Nav."""
+        name, ok = QInputDialog.getText(self, "Neuer Ordner", "Name des neuen Ordners:")
+        if not (ok and name.strip()):
+            return
+        new_path = IMPORT_DIR / name.strip()
+        try:
+            new_path.mkdir(exist_ok=False)
+        except Exception as e:
+            QMessageBox.critical(self, "Fehler", f"Ordner konnte nicht erstellt werden:\n{e}")
+            return
+        # Neu in die Nav einfügen und sichtbar machen
+        provider = QFileIconProvider()
+        icon = provider.icon(QFileIconProvider.Folder)
+        self.folder_nav.addItem(QListWidgetItem(icon, name.strip()))
 
 
 if __name__ == "__main__":
